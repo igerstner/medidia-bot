@@ -1,6 +1,7 @@
 const express = require('express');
-const admin = require('firebase-admin');
 const twilio = require('twilio');
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getFirestore } = require('firebase-admin/firestore');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -8,10 +9,10 @@ app.use(express.json());
 
 // Inicializar Firebase Admin
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
+initializeApp({
+  credential: cert(serviceAccount),
 });
-const db = admin.firestore();
+const db = getFirestore();
 
 const MessagingResponse = twilio.twiml.MessagingResponse;
 
