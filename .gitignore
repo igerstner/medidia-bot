@@ -1,2 +1,3 @@
 node_modules/
 serviceAccount.json
+twilio_2FA_recovery_code.txt
