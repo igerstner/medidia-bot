@@ -2,6 +2,7 @@ const express = require('express');
 const twilio = require('twilio');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore } = require('firebase-admin/firestore');
+const { getAuth } = require('firebase-admin/auth');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -51,6 +52,45 @@ app.post('/bot', async (req, res) => {
   res.end(twiml.toString());
 });
 
+// El código en sí nunca se devuelve al cliente ni se compara del lado de la app:
+// si el que verifica (el solicitante) pudiera leer 'codigos_verificacion' directo,
+// no haría falta que el destinatario se lo confirme por WhatsApp. Por eso la
+// comparación vive acá, con Admin SDK, y la app solo recibe true/false.
+async function validarYConsumirCodigoVinculo(uid, codigoIngresado) {
+  const ahora = new Date();
+  const snapshot = await db.collection('codigos_verificacion')
+    .where('uid', '==', uid)
+    .where('usado', '==', false)
+    .get();
+
+  for (const docSnap of snapshot.docs) {
+    const data = docSnap.data();
+    const expira = data.expiresAt?.toDate ? data.expiresAt.toDate() : data.expiresAt;
+    if (!expira || expira < ahora) continue;
+    if ((data.intentos || 0) >= 5) continue; // demasiados intentos fallidos, código invalidado
+    if (data.codigo === codigoIngresado) {
+      await docSnap.ref.update({ usado: true });
+      return true;
+    }
+    await docSnap.ref.update({ intentos: (data.intentos || 0) + 1 });
+  }
+  return false;
+}
+
+app.post('/verificar-codigo-vinculo', async (req, res) => {
+  const { uid, codigo } = req.body;
+  if (!uid || !codigo) {
+    return res.status(400).json({ ok: false, error: 'Parámetros faltantes' });
+  }
+  try {
+    const valido = await validarYConsumirCodigoVinculo(uid, codigo);
+    res.json({ ok: valido });
+  } catch (error) {
+    console.error('Error en /verificar-codigo-vinculo:', error);
+    res.status(500).json({ ok: false, error: 'No se pudo verificar el código' });
+  }
+});
+
 app.post('/enviar-codigo', async (req, res) => {
   const { telefono, codigo, nombreSolicitante } = req.body;
   if (!telefono || !codigo || !nombreSolicitante) {
@@ -73,6 +113,80 @@ app.post('/enviar-codigo', async (req, res) => {
   }
 });
 
+// Reset de contraseña por WhatsApp
+// -----------------------------------------------------------------------------
+// Rate limit en memoria: alcanza para una sola instancia de Render. Si algún día
+// se escala a más de una instancia, reemplazar por un contador en Firestore.
+const intentosResetPorTelefono = new Map();
+const LIMITE_SOLICITUDES_RESET = 3;
+const VENTANA_RESET_MS = 15 * 60 * 1000;
+
+function puedeSolicitarReset(telefono) {
+  const ahora = Date.now();
+  const registro = intentosResetPorTelefono.get(telefono);
+  if (!registro || ahora > registro.expiraEn) {
+    intentosResetPorTelefono.set(telefono, { conteo: 1, expiraEn: ahora + VENTANA_RESET_MS });
+    return true;
+  }
+  if (registro.conteo >= LIMITE_SOLICITUDES_RESET) return false;
+  registro.conteo += 1;
+  return true;
+}
+
+app.post('/solicitar-reset', async (req, res) => {
+  const { telefono } = req.body;
+  if (!telefono) {
+    return res.status(400).json({ ok: false, error: 'Falta el teléfono' });
+  }
+  // Responde 'ok' siempre exista o no la cuenta, para no filtrar qué números están registrados.
+  try {
+    if (puedeSolicitarReset(telefono)) {
+      const uid = await obtenerUidPorTelefono(telefono);
+      if (uid) {
+        const codigo = generarCodigoReset();
+        await guardarCodigoReset(uid, codigo);
+        const destino = telefono.startsWith('whatsapp:') ? telefono : `whatsapp:${telefono}`;
+        await twilioClient.messages.create({
+          from: TWILIO_WHATSAPP_FROM,
+          to: destino,
+          body:
+            `🔐 Tu código para restablecer tu contraseña de MediDía es: ${codigo}\n` +
+            `Expira en 10 minutos. Si no lo pediste vos, ignorá este mensaje.`,
+        });
+      }
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error en /solicitar-reset:', error);
+    res.json({ ok: true }); // no filtramos info interna aunque falle algo
+  }
+});
+
+app.post('/confirmar-reset', async (req, res) => {
+  const { telefono, codigo, nuevaContrasena } = req.body;
+  if (!telefono || !codigo || !nuevaContrasena) {
+    return res.status(400).json({ ok: false, error: 'Parámetros faltantes' });
+  }
+  if (nuevaContrasena.length < 6) {
+    return res.status(400).json({ ok: false, error: 'La contraseña debe tener al menos 6 caracteres' });
+  }
+  try {
+    const uid = await obtenerUidPorTelefono(telefono);
+    if (!uid) {
+      return res.status(400).json({ ok: false, error: 'Código incorrecto o expirado' });
+    }
+    const valido = await validarYConsumirCodigoReset(uid, codigo);
+    if (!valido) {
+      return res.status(400).json({ ok: false, error: 'Código incorrecto o expirado' });
+    }
+    await getAuth().updateUser(uid, { password: nuevaContrasena });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error en /confirmar-reset:', error);
+    res.status(500).json({ ok: false, error: 'No se pudo restablecer la contraseña' });
+  }
+});
+
 app.get('/', (req, res) => res.send('MediDía Bot corriendo ✅'));
 
 async function obtenerUidPorTelefono(telefono) {
@@ -80,6 +194,45 @@ async function obtenerUidPorTelefono(telefono) {
   const snapshot = await db.collection('usuarios').where('telefono', '==', telefono).get();
   if (snapshot.empty) return null;
   return snapshot.docs[0].id;
+}
+
+function generarCodigoReset() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+async function guardarCodigoReset(uid, codigo) {
+  const ahora = new Date();
+  const expiraEn = new Date(ahora.getTime() + 10 * 60 * 1000);
+  await db.collection('codigos_reset_password').add({
+    uid,
+    codigo,
+    creadoEn: ahora,
+    expiraEn,
+    usado: false,
+    intentos: 0,
+  });
+}
+
+// Colección separada de 'codigos_verificacion' (vinculación familiar) a propósito:
+// distinto dominio de seguridad, y este solo lo lee/escribe el bot con Admin SDK.
+async function validarYConsumirCodigoReset(uid, codigoIngresado) {
+  const ahora = new Date();
+  const snapshot = await db.collection('codigos_reset_password')
+    .where('uid', '==', uid)
+    .where('usado', '==', false)
+    .get();
+
+  for (const docSnap of snapshot.docs) {
+    const data = docSnap.data();
+    if (data.expiraEn.toDate() < ahora) continue;
+    if ((data.intentos || 0) >= 5) continue; // demasiados intentos fallidos, código invalidado
+    if (data.codigo === codigoIngresado) {
+      await docSnap.ref.update({ usado: true });
+      return true;
+    }
+    await docSnap.ref.update({ intentos: (data.intentos || 0) + 1 });
+  }
+  return false;
 }
 
 async function obtenerTurnos(userId) {
