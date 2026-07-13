@@ -19,6 +19,16 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 const MessagingResponse = twilio.twiml.MessagingResponse;
 const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886';
 
+// Twilio exige formato E.164 con "+" en el número de WhatsApp destino.
+// normalizarTelefono() del lado de la app deja solo dígitos (sin "+"), así que
+// hay que agregarlo acá antes de mandar. Sin esto Twilio rechaza el mensaje
+// (o falla silenciosamente si el error queda atrapado en el catch de arriba).
+function aDestinoWhatsApp(telefono) {
+  if (telefono.startsWith('whatsapp:+')) return telefono;
+  if (telefono.startsWith('whatsapp:')) return `whatsapp:+${telefono.slice('whatsapp:'.length)}`;
+  return `whatsapp:+${telefono.replace(/\D/g, '')}`;
+}
+
 app.post('/bot', async (req, res) => {
   const twiml = new MessagingResponse();
   const mensaje = (req.body.Body || '').trim().toLowerCase();
@@ -97,7 +107,7 @@ app.post('/enviar-codigo', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Parámetros faltantes' });
   }
   try {
-    const destino = telefono.startsWith('whatsapp:') ? telefono : `whatsapp:${telefono}`;
+    const destino = aDestinoWhatsApp(telefono);
     await twilioClient.messages.create({
       from: TWILIO_WHATSAPP_FROM,
       to: destino,
@@ -145,7 +155,7 @@ app.post('/solicitar-reset', async (req, res) => {
       if (uid) {
         const codigo = generarCodigoReset();
         await guardarCodigoReset(uid, codigo);
-        const destino = telefono.startsWith('whatsapp:') ? telefono : `whatsapp:${telefono}`;
+        const destino = aDestinoWhatsApp(telefono);
         await twilioClient.messages.create({
           from: TWILIO_WHATSAPP_FROM,
           to: destino,
