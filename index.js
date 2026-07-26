@@ -17,7 +17,24 @@ const db = getFirestore();
 
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const MessagingResponse = twilio.twiml.MessagingResponse;
-const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || 'whatsapp:+14155238886';
+
+// Twilio exige formato E.164 con "+" (y el prefijo "whatsapp:") tanto en el
+// número de origen como en el de destino. Si a cualquiera de los dos le falta
+// algo, Twilio rechaza el mensaje en silencio: no tira error, simplemente no
+// llega nada (ya costó una sesión de debug, commit 7bfc58c). normalizarTelefono()
+// del lado de la app deja el destino solo con dígitos, así que hay que agregar
+// el resto acá antes de mandar.
+//
+// Se aplica también a TWILIO_WHATSAPP_FROM al cargar la variable de entorno,
+// para que quien la configure en Render (con o sin "whatsapp:", con o sin "+")
+// no pueda repetir el mismo bug del lado del origen.
+function aDestinoWhatsApp(telefono) {
+  if (telefono.startsWith('whatsapp:+')) return telefono;
+  if (telefono.startsWith('whatsapp:')) return `whatsapp:+${telefono.slice('whatsapp:'.length)}`;
+  return `whatsapp:+${telefono.replace(/\D/g, '')}`;
+}
+
+const TWILIO_WHATSAPP_FROM = aDestinoWhatsApp(process.env.TWILIO_WHATSAPP_FROM || '14155238886');
 
 app.post('/bot', async (req, res) => {
   const twiml = new MessagingResponse();
@@ -97,7 +114,7 @@ app.post('/enviar-codigo', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Parámetros faltantes' });
   }
   try {
-    const destino = telefono.startsWith('whatsapp:') ? telefono : `whatsapp:${telefono}`;
+    const destino = aDestinoWhatsApp(telefono);
     await twilioClient.messages.create({
       from: TWILIO_WHATSAPP_FROM,
       to: destino,
@@ -145,7 +162,7 @@ app.post('/solicitar-reset', async (req, res) => {
       if (uid) {
         const codigo = generarCodigoReset();
         await guardarCodigoReset(uid, codigo);
-        const destino = telefono.startsWith('whatsapp:') ? telefono : `whatsapp:${telefono}`;
+        const destino = aDestinoWhatsApp(telefono);
         await twilioClient.messages.create({
           from: TWILIO_WHATSAPP_FROM,
           to: destino,
