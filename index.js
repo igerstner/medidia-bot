@@ -217,9 +217,20 @@ function generarCodigoReset() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
+// Antes de crear el código nuevo, invalida los anteriores sin usar de ese uid.
+// Sin esto, pedir el código varias veces (típico en debugging, o si el primer
+// WhatsApp tarda) deja varios códigos válidos al mismo tiempo, y es fácil
+// terminar tipeando uno viejo que ya venció mientras el más nuevo seguía activo.
 async function guardarCodigoReset(uid, codigo) {
   const ahora = new Date();
   const expiraEn = new Date(ahora.getTime() + 10 * 60 * 1000);
+
+  const anteriores = await db.collection('codigos_reset_password')
+    .where('uid', '==', uid)
+    .where('usado', '==', false)
+    .get();
+  await Promise.all(anteriores.docs.map(d => d.ref.update({ usado: true })));
+
   await db.collection('codigos_reset_password').add({
     uid,
     codigo,
